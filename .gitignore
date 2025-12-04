@@ -1,0 +1,14 @@
+# Virtual environment
+bin/
+lib/
+include/
+etc/
+share/
+pyvenv.cfg
+
+# Large data files
+*.csv
+
+# Python
+__pycache__/
+*.pyc
