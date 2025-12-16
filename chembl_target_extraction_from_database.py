@@ -2,60 +2,47 @@ import re
 import pandas as pd
 import os
 import argparse
-import requests
-import time
+import sqlite3
 
-CHEMBL_BASE = "https://www.ebi.ac.uk/chembl/api/data"
-MAX_RETRIES = 5
-RETRY_DELAY = 5
+# Update this path to where your database is
 
-def make_request_with_retry(url, params=None):
-    """Make a request with retries and exponential backoff"""
-    delay = RETRY_DELAY
-    for attempt in range(MAX_RETRIES):
-        try:
-            resp = requests.get(url, params=params, timeout=5)  # longer timeout
-            if resp.status_code == 200:
-                return resp.json()
-            elif resp.status_code >= 500:
-                print(f"  Server error ({resp.status_code}), retry {attempt + 1}/{MAX_RETRIES}...")
-                time.sleep(delay)
-                delay *= 2
-            else:
-                return None
-        except (requests.Timeout, requests.ConnectionError) as e:
-            print(f"  Connection issue, retry {attempt + 1}/{MAX_RETRIES}...")
-            time.sleep(delay)
-            delay *= 2
-    print(f"  Failed after {MAX_RETRIES} retries")
+CHEMBL_DB_PATH = "/Users/sarahconstantin/Documents/Documents/clinicaltargets/chembl_35/chembl_35_sqlite/chembl_35.db"
+
+def get_connection():
+    return sqlite3.connect(CHEMBL_DB_PATH)
+
+def get_molecule_by_synonym(drug_name, cursor):
+    """Search for molecule by synonym"""
+    cursor.execute("""
+        SELECT DISTINCT md.chembl_id, md.pref_name, md.first_approval
+        FROM molecule_dictionary md
+        JOIN molecule_synonyms ms ON md.molregno = ms.molregno
+        WHERE UPPER(ms.synonyms) = UPPER(?)
+        LIMIT 1
+    """, (drug_name,))
+    row = cursor.fetchone()
+    if row:
+        return {'molecule_chembl_id': row[0], 'pref_name': row[1], 'first_approval': row[2]}
     return None
 
-def get_molecule_by_synonym(drug_name):
-    url = f"{CHEMBL_BASE}/molecule.json"
-    params = {"molecule_synonyms__molecule_synonym__iexact": drug_name}
-    data = make_request_with_retry(url, params)
-    if data and data.get('molecules'):
-        return data['molecules'][0]
-    return None
-
-def get_mechanisms(chembl_id):
-    url = f"{CHEMBL_BASE}/mechanism.json"
-    params = {"molecule_chembl_id": chembl_id}
-    data = make_request_with_retry(url, params)
-    if data:
-        return data.get('mechanisms', [])
-    return []
-
-def get_target(target_chembl_id):
-    url = f"{CHEMBL_BASE}/target/{target_chembl_id}.json"
-    return make_request_with_retry(url)
+def get_targets_for_molecule(chembl_id, cursor):
+    """Get all targets for a molecule via mechanism of action"""
+    cursor.execute("""
+        SELECT DISTINCT td.pref_name
+        FROM drug_mechanism dm
+        JOIN target_dictionary td ON dm.tid = td.tid
+        WHERE dm.molregno = (
+            SELECT molregno FROM molecule_dictionary WHERE chembl_id = ?
+        )
+    """, (chembl_id,))
+    return [row[0] for row in cursor.fetchall() if row[0]]
 
 def extract_year(date_str):
     if pd.isna(date_str) or date_str == '':
         return None
     return int(str(date_str).split('-')[0])
 
-def process_row(idx, dataset):
+def process_row(idx, dataset, cursor):
     drug = dataset['Interventions'][idx]
     startdate_raw = dataset['Start Date'][idx]
     startdate = extract_year(startdate_raw)
@@ -64,28 +51,14 @@ def process_row(idx, dataset):
     truedrugs = list(d.split(": ")[1] for d in drug.strip("'").split("|") if "Placebo" not in d)
     truedrugs = set([' '.join(re.sub(r'\b\d+\s*mg\b', '', s, flags=re.IGNORECASE).split()) for s in truedrugs])
 
-    print(f"  Drugs: {truedrugs}")
-
     target_success = []
 
     for thisdrug in truedrugs:
-        print(f"    Looking up: {thisdrug}")
-        mol = get_molecule_by_synonym(thisdrug)
+        mol = get_molecule_by_synonym(thisdrug, cursor)
         if mol:
             chembl_id = mol['molecule_chembl_id']
-            print(f"    Found: {chembl_id}")
-            mechanisms = get_mechanisms(chembl_id)
-            approval_date = mol.get('first_approval')
-
-            target_names = []
-            for mech in mechanisms:
-                target_id = mech.get('target_chembl_id')
-                if target_id:
-                    target_info = get_target(target_id)
-                    if target_info:
-                        target_names.append(target_info.get('pref_name', 'N/A'))
-
-            print(f"    Targets: {target_names}, Approval: {approval_date}")
+            approval_date = mol['first_approval']
+            target_names = get_targets_for_molecule(chembl_id, cursor)
 
             for target_name in target_names:
                 if approval_date is not None and startdate is not None and startdate <= approval_date:
@@ -98,8 +71,6 @@ def process_row(idx, dataset):
                     target_success.append([nct, startdate, approval_date, target_name, 'Approved Drug'])
                 else:
                     target_success.append([nct, startdate, approval_date, target_name, 'Unknown'])
-        else:
-            print(f"    Not found in ChEMBL")
 
     return target_success
 
@@ -116,10 +87,14 @@ def run_all_with_checkpoints(dataset, checkpoint_every=100, output_file="target_
             start_idx = int(f.read().strip()) + 1
         print(f"Loaded {len(all_results)} existing results, resuming from row {start_idx}")
 
+    conn = get_connection()
+    cursor = conn.cursor()
+
     for idx in range(start_idx, len(dataset)):
-        print(f"Processing row {idx + 1}/{len(dataset)}")
+        if idx % 100 == 0:
+            print(f"Processing row {idx + 1}/{len(dataset)}")
         try:
-            row_results = process_row(idx, dataset)
+            row_results = process_row(idx, dataset, cursor)
             all_results.extend(row_results)
         except Exception as e:
             print(f"Error on row {idx}: {e}")
@@ -132,6 +107,8 @@ def run_all_with_checkpoints(dataset, checkpoint_every=100, output_file="target_
             with open(progress_file, 'w') as f:
                 f.write(str(idx))
 
+    conn.close()
+
     results_df = pd.DataFrame(all_results, columns=["NCT Number", "Start Date", "Approval Date", "Target", "Success"])
     results_df.to_csv(output_file, index=False)
 
@@ -143,10 +120,10 @@ def run_all_with_checkpoints(dataset, checkpoint_every=100, output_file="target_
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Extract drug targets from clinical trials data using ChEMBL')
+    parser = argparse.ArgumentParser(description='Extract drug targets from clinical trials data using local ChEMBL')
     parser.add_argument('input_file', help='Path to input CSV file')
     parser.add_argument('-o', '--output', default='target_results.csv', help='Output CSV file')
-    parser.add_argument('-c', '--checkpoint', type=int, default=50, help='Save checkpoint every N rows')
+    parser.add_argument('-c', '--checkpoint', type=int, default=1000, help='Save checkpoint every N rows')
     parser.add_argument('-p', '--progress', default='progress.txt', help='Progress file')
 
     args = parser.parse_args()
