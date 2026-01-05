@@ -47,6 +47,7 @@ def process_row(idx, dataset, cursor):
     startdate_raw = dataset['Start Date'][idx]
     startdate = extract_year(startdate_raw)
     nct = dataset['NCT Number'][idx]
+    conditions = dataset['Conditions'][idx]
 
     truedrugs = list(d.split(": ")[1] for d in drug.strip("'").split("|") if "Placebo" not in d)
     truedrugs = set([' '.join(re.sub(r'\b\d+\s*mg\b', '', s, flags=re.IGNORECASE).split()) for s in truedrugs])
@@ -62,15 +63,15 @@ def process_row(idx, dataset, cursor):
 
             for target_name in target_names:
                 if approval_date is not None and startdate is not None and startdate <= approval_date:
-                    target_success.append([nct, startdate, approval_date, target_name, 'Success'])
+                    target_success.append([nct, startdate, approval_date, conditions, target_name, 'Success'])
                 elif approval_date is None:
-                    target_success.append([nct, startdate, approval_date, target_name, 'No Success'])
+                    target_success.append([nct, startdate, approval_date, conditions, target_name, 'No Success'])
                 elif approval_date is not None and startdate is not None and startdate > approval_date:
-                    target_success.append([nct, startdate, approval_date, target_name, 'Old Approved Drug'])
+                    target_success.append([nct, startdate, approval_date, conditions, target_name, 'Old Approved Drug'])
                 elif approval_date is not None and startdate is None:
-                    target_success.append([nct, startdate, approval_date, target_name, 'Approved Drug'])
+                    target_success.append([nct, startdate, approval_date, conditions, target_name, 'Approved Drug'])
                 else:
-                    target_success.append([nct, startdate, approval_date, target_name, 'Unknown'])
+                    target_success.append([nct, startdate, approval_date, conditions, target_name, 'Unknown'])
 
     return target_success
 
@@ -102,14 +103,14 @@ def run_all_with_checkpoints(dataset, checkpoint_every=100, output_file="target_
 
         if (idx + 1) % checkpoint_every == 0:
             print(f"Saving checkpoint at row {idx + 1}...")
-            temp_df = pd.DataFrame(all_results, columns=["NCT Number", "Start Date", "Approval Date", "Target", "Success"])
+            temp_df = pd.DataFrame(all_results, columns=["NCT Number", "Start Date", "Approval Date", "Conditions", "Target", "Success"])
             temp_df.to_csv(output_file, index=False)
             with open(progress_file, 'w') as f:
                 f.write(str(idx))
 
     conn.close()
 
-    results_df = pd.DataFrame(all_results, columns=["NCT Number", "Start Date", "Approval Date", "Target", "Success"])
+    results_df = pd.DataFrame(all_results, columns=["NCT Number", "Start Date", "Approval Date", "Conditions", "Target", "Success"])
     results_df.to_csv(output_file, index=False)
 
     if os.path.exists(progress_file):
